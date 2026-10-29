@@ -1,0 +1,361 @@
+/**
+ * @file    vision_task.c
+ * @brief   视觉应用层：调用驱动 → 拿 rgb_frame → 处理 → 出结果
+ *
+ * 【重要】本文件只调用驱动，不修改驱动。
+ *   dcmi_app.h  : DCMI_App_Init / DCMI_RGB_Start / xRgbFrameSem / rgb_frame / DCMI_RGB_Next
+ *   ov2640.h    : OV2640_Init
+ *   lcd_144.h   : Lcd_Init / Lcd_Clear / Lcd_ShowString / Lcd_ShowCameraFrameScaled
+ *   cam_lcd.h   : Usb_PrintStr / Usb_Printf（虚拟串口打印）
+ *
+ * 本文件实现的算法（对应《视觉第一讲》前几页）：
+ *   1. RGB565 转灰度
+ *   2. Otsu 自动阈值（或固定阈值）
+ *   3. 逐行扫描找白色区间 → 左右边界 → 中线
+ *   4. 输出近处中线偏差
+ *
+ * 说明：现在只用「逐行扫描」，还没有做迷宫追边、IPM、角点。这些是后续步骤。
+ */
+
+#include "app_config.h"
+#include "vision_task.h"
+
+#include "main.h"
+#include "dcmi_app.h"
+#include "ov2640.h"
+#include "lcd_144.h"
+#include "cam_lcd.h"        /* Usb_PrintStr / Usb_Printf */
+#include "usb_device.h"     /* MX_USB_DEVICE_Init */
+
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+
+#include <string.h>
+#include <stdio.h>
+
+/* ===================== 参数 ===================== */
+
+#define WAIT_USB_MS     1500U   /* 上电后等电脑枚举虚拟串口 */
+#define FRAME_WAIT_MS   1000U   /* 等一帧最多等多久 */
+#define FPS_WIN_MS      1000U   /* 每 1 秒统计一次帧率 */
+#define LCD_TEXT_MS     500U    /* 屏上文字每 500ms 刷一次，省 SPI 时间 */
+
+/* ===================== 模块状态 ===================== */
+
+static vision_result_t s_result;
+
+/* ===================== 小工具 ===================== */
+
+/* RGB565 → 灰度（0~255）
+ * RGB565 布局： RRRRR GGGGGG BBBBB
+ * 把 5/6/5 位各扩到 8 位，再按 77/151/28 加权（整数近似）
+ * 权重和 = 256，最后右移 8 位。 */
+static uint8_t Rgb565_ToGray(uint16_t px)
+{
+    uint8_t r = (uint8_t)((px >> 11) & 0x1Fu);
+    uint8_t g = (uint8_t)((px >> 5) & 0x3Fu);
+    uint8_t b = (uint8_t)(px & 0x1Fu);
+    uint32_t r8 = ((uint32_t)r << 3) | ((uint32_t)r >> 2);
+    uint32_t g8 = ((uint32_t)g << 2) | ((uint32_t)g >> 4);
+    uint32_t b8 = ((uint32_t)b << 3) | ((uint32_t)b >> 2);
+    return (uint8_t)(((77u * r8) + (151u * g8) + (28u * b8)) >> 8);
+}
+
+/* Otsu：在 ROI 内统计灰度直方图，求使类间方差最大的阈值
+ * 返回 0~255 的阈值 */
+static uint8_t Vision_Otsu(const uint16_t *frame)
+{
+    uint32_t hist[256];
+    uint32_t total;
+    uint32_t sum_all;
+    uint32_t sum_b;
+    uint32_t w_b;
+    uint32_t max_var;
+    uint8_t  best_t;
+    uint32_t y, x;
+    int      t;
+    uint8_t  g;
+
+    memset(hist, 0, sizeof(hist));
+
+    /* 第一遍：统计直方图 */
+    for (y = 0; y < ROI_H; y++) {
+        const uint16_t *row = frame + (uint32_t)(ROI_Y0 + y) * IMG_W + ROI_X0;
+        for (x = 0; x < ROI_W; x++) {
+            g = Rgb565_ToGray(row[x]);
+            hist[g]++;
+        }
+    }
+
+    total = (uint32_t)ROI_H * ROI_W;
+    sum_all = 0;
+    for (t = 0; t < 256; t++) {
+        sum_all += (uint32_t)t * hist[t];
+    }
+
+    sum_b = 0;
+    w_b = 0;
+    max_var = 0;
+    best_t = 128;
+
+    for (t = 0; t < 256; t++) {
+        uint32_t w_f;
+        uint32_t sum_f;
+        int32_t  d;
+        uint32_t var;
+
+        w_b += hist[t];
+        if (w_b == 0) {
+            continue;
+        }
+        w_f = total - w_b;
+        if (w_f == 0) {
+            break;
+        }
+
+        sum_b += (uint32_t)t * hist[t];
+        sum_f = sum_all - sum_b;
+
+        /* 类间方差 = w_b*w_f*((mean_b-mean_f)^2)，用整数避免除法 */
+        d = (int32_t)(sum_b / w_b) - (int32_t)(sum_f / w_f);
+        var = w_b * w_f * (uint32_t)(d * d);
+
+        if (var > max_var) {
+            max_var = var;
+            best_t = (uint8_t)t;
+        }
+    }
+
+    return best_t;
+}
+
+/* 在指定行找最长白色区间，输出左右边界
+ * 返回 1 找到，0 没找到 */
+static uint8_t Vision_FindEdges(const uint16_t *frame, uint16_t row_in_roi,
+                                uint8_t threshold, int16_t *left, int16_t *right)
+{
+    const uint16_t *row = frame + (uint32_t)(ROI_Y0 + row_in_roi) * IMG_W + ROI_X0;
+    uint16_t x;
+    uint16_t run_start;
+    uint8_t  in_run;
+    uint16_t best_len;
+    uint16_t best_l;
+    uint16_t best_r;
+
+    run_start = 0;
+    in_run = 0;
+    best_len = 0;
+    best_l = 0;
+    best_r = 0;
+
+    for (x = 0; x < ROI_W; x++) {
+        uint8_t white = (Rgb565_ToGray(row[x]) > threshold) ? 1u : 0u;
+
+        if (white) {
+            if (!in_run) {
+                in_run = 1;
+                run_start = x;
+            }
+        } else {
+            if (in_run) {
+                uint16_t len = (uint16_t)(x - run_start);
+                if (len > best_len) {
+                    best_len = len;
+                    best_l = run_start;
+                    best_r = (uint16_t)(x - 1u);
+                }
+                in_run = 0;
+            }
+        }
+    }
+    /* 收尾：白到行末 */
+    if (in_run) {
+        uint16_t len = (uint16_t)(ROI_W - run_start);
+        if (len > best_len) {
+            best_len = len;
+            best_l = run_start;
+            best_r = (uint16_t)(ROI_W - 1u);
+        }
+    }
+
+    /* 太窄的区间不算赛道（防止噪点） */
+    if (best_len < 8u) {
+        *left = -1;
+        *right = -1;
+        return 0;
+    }
+
+    *left = (int16_t)(ROI_X0 + best_l);
+    *right = (int16_t)(ROI_X0 + best_r);
+    return 1;
+}
+
+/* 核心处理：一帧 → 结果 */
+static void Vision_ProcessFrame(const uint16_t *frame, uint32_t frame_id)
+{
+    uint8_t threshold;
+    int16_t l, r;
+    uint16_t y, x;
+    uint32_t white_cnt;
+
+    s_result.frame_id = frame_id;
+
+#if APP_USE_OTSU
+    threshold = Vision_Otsu(frame);
+#else
+    threshold = APP_FIXED_THRESHOLD;
+#endif
+    s_result.threshold = threshold;
+
+    /* 统计白色像素比例，用来判断阈值是否合适 */
+    white_cnt = 0;
+    for (y = 0; y < ROI_H; y += 2u) {          /* 隔行统计，省时间 */
+        const uint16_t *row = frame + (uint32_t)(ROI_Y0 + y) * IMG_W + ROI_X0;
+        for (x = 0; x < ROI_W; x += 2u) {
+            if (Rgb565_ToGray(row[x]) > threshold) {
+                white_cnt++;
+            }
+        }
+    }
+    s_result.white_cnt = (uint16_t)white_cnt;
+
+    /* 近处扫描行找边界 */
+    if (Vision_FindEdges(frame, SCAN_ROW_NEAR, threshold, &l, &r)) {
+        int16_t center = (int16_t)((l + r) / 2);
+
+        s_result.valid = 1u;
+        s_result.left_edge = l;
+        s_result.right_edge = r;
+        /* 偏差 = 中线 - 画面中心（右为正） */
+        s_result.mid_offset = (int16_t)(center - (IMG_W / 2));
+    } else {
+        s_result.valid = 0u;
+        s_result.left_edge = -1;
+        s_result.right_edge = -1;
+        s_result.mid_offset = 0;
+    }
+}
+
+void Vision_GetResult(vision_result_t *out)
+{
+    if (out != NULL) {
+        *out = s_result;
+    }
+}
+
+/* ===================== 任务入口 ===================== */
+
+void VisionTask(void *arg)
+{
+    uint32_t frames;
+    uint32_t fps;
+    TickType_t last_tick;
+    TickType_t last_lcd_tick;
+
+    (void)arg;
+
+    /* --- 1. USB 虚拟串口（只用来打印，不接也能跑） --- */
+    MX_USB_DEVICE_Init();
+    vTaskDelay(pdMS_TO_TICKS(WAIT_USB_MS));
+
+    Usb_PrintStr("\r\n===== 校赛整合工程 / VisionTask =====\r\n");
+
+    /* --- 2. 屏幕先点亮，证明 SPI 和屏是好的 --- */
+    Lcd_Init();
+    Lcd_Clear(LCD_BLUE);
+    Lcd_ShowString(4,  8, "VISION",     LCD_YELLOW, LCD_BLUE);
+    Lcd_ShowString(4, 28, "INIT...",    LCD_WHITE,  LCD_BLUE);
+    Usb_PrintStr("LCD OK\r\n");
+
+    /* --- 3. 摄像头：SCCB 初始化 + 读 ID --- */
+    DCMI_App_Init();
+    if (OV2640_Init() != 0u) {
+        Lcd_ShowString(4, 48, "CAM FAIL", LCD_RED, LCD_BLUE);
+        Usb_PrintStr("OV2640_Init FAIL\r\n");
+        vTaskDelete(NULL);
+    }
+    Lcd_ShowString(4, 48, "CAM OK", LCD_GREEN, LCD_BLUE);
+    Usb_PrintStr("OV2640 OK\r\n");
+
+    /* --- 4. 启动 RGB565 320x240 采集 --- */
+    if (DCMI_RGB_Start() != 0u) {
+        Usb_PrintStr("DCMI_RGB_Start FAIL\r\n");
+        vTaskDelete(NULL);
+    }
+    Usb_PrintStr("capture started\r\n");
+
+    memset(&s_result, 0, sizeof(s_result));
+
+    frames = 0u;
+    fps = 0u;
+    last_tick = xTaskGetTickCount();
+    last_lcd_tick = last_tick;
+
+    for (;;) {
+        TickType_t now;
+
+        /* ---- 1. 等一帧收完 ---- */
+        if (xSemaphoreTake(xRgbFrameSem, pdMS_TO_TICKS(FRAME_WAIT_MS)) != pdTRUE) {
+            Usb_PrintStr("frame timeout\r\n");
+            (void)DCMI_RGB_Next();
+            continue;
+        }
+
+        /* ---- 2. 丢 Cache（DMA 直接写内存，CPU 的 Cache 不知道） ---- */
+        SCB_InvalidateDCache_by_Addr((uint32_t *)rgb_frame,
+                                     (int32_t)(RGB_FRAME_PIXELS * 2u));
+
+        /* ---- 3. ★★★ 你的算法在这里 ★★★ ---- */
+        Vision_ProcessFrame(rgb_frame, rgb_frame_cnt);
+
+        /* ---- 4. 显示 ---- */
+        now = xTaskGetTickCount();
+
+#if APP_SHOW_CAMERA
+        Lcd_ShowCameraFrameScaled(rgb_frame, RGB_W, RGB_H);
+#else
+        {
+            char line[24];
+            uint32_t dt_lcd = (uint32_t)((now - last_lcd_tick) * portTICK_PERIOD_MS);
+            if (dt_lcd >= LCD_TEXT_MS) {
+                last_lcd_tick = now;
+
+                Lcd_FillRect(0, 68, 128, 60, LCD_BLUE);
+
+                (void)snprintf(line, sizeof(line), "fps %u", (unsigned)fps);
+                Lcd_ShowString(4, 68, line, LCD_YELLOW, LCD_BLUE);
+
+                (void)snprintf(line, sizeof(line), "off %d", (int)s_result.mid_offset);
+                Lcd_ShowString(4, 88, line, LCD_WHITE, LCD_BLUE);
+
+                (void)snprintf(line, sizeof(line), "th %u", (unsigned)s_result.threshold);
+                Lcd_ShowString(4, 108, line, LCD_WHITE, LCD_BLUE);
+            }
+        }
+#endif
+
+        /* ---- 5. 帧率统计 ---- */
+        frames++;
+        {
+            uint32_t dt = (uint32_t)((now - last_tick) * portTICK_PERIOD_MS);
+            if (dt >= FPS_WIN_MS) {
+                fps = (dt > 0u) ? ((frames * 1000u) / dt) : 0u;
+#if APP_USB_LOG
+                Usb_Printf("[fps] %u  frame %u  valid %u  off %d  th %u  white %u\r\n",
+                           (unsigned)fps,
+                           (unsigned)s_result.frame_id,
+                           (unsigned)s_result.valid,
+                           (int)s_result.mid_offset,
+                           (unsigned)s_result.threshold,
+                           (unsigned)s_result.white_cnt);
+#endif
+                frames = 0u;
+                last_tick = now;
+            }
+        }
+
+        /* ---- 6. 重启下一帧（snapshot 模式：处理完才开下一帧） ---- */
+        (void)DCMI_RGB_Next();
+    }
+}

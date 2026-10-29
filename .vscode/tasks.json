@@ -1,0 +1,59 @@
+{
+    "// 说明": "Ctrl+Shift+B 构建。使用 CMake Presets（Debug/Release）。",
+    "// 前置": "需安装 CMake Tools 扩展，且 PATH 里有 arm-none-eabi-gcc / cmake / ninja。",
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake Configure (Debug)",
+            "type": "shell",
+            "command": "cmake",
+            "args": ["--preset", "Debug"],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "CMake Build (Debug)",
+            "type": "shell",
+            "command": "cmake",
+            "args": ["--build", "--preset", "Debug"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "dependsOn": "CMake Configure (Debug)",
+            "problemMatcher": {
+                "base": "$gcc",
+                "fileLocation": ["autoDetect", "${workspaceFolder}"]
+            }
+        },
+        {
+            "label": "CMake Build (Release)",
+            "type": "shell",
+            "command": "cmake",
+            "args": ["--build", "--preset", "Release"],
+            "group": "build",
+            "problemMatcher": {
+                "base": "$gcc",
+                "fileLocation": ["autoDetect", "${workspaceFolder}"]
+            }
+        },
+        {
+            "label": "清理构建目录",
+            "type": "shell",
+            "command": "powershell",
+            "args": ["-Command", "Remove-Item -Recurse -Force '${workspaceFolder}/build' -ErrorAction SilentlyContinue"],
+            "problemMatcher": []
+        },
+        {
+            "label": "烧录（OpenOCD + ST-Link）",
+            "type": "shell",
+            "command": "openocd",
+            "args": [
+                "-f", "interface/stlink.cfg",
+                "-f", "target/stm32h7x.cfg",
+                "-c", "program ${workspaceFolder}/build/Debug/cam_lcd_demo.hex verify reset exit"
+            ],
+            "problemMatcher": []
+        }
+    ]
+}

@@ -1,0 +1,50 @@
+# ===== Keil / MDK 编译产物 =====
+MDK-ARM/*/
+!MDK-ARM/DebugConfig/
+MDK-ARM/*.uvguix.*
+*.o
+*.d
+*.crf
+*.axf
+*.hex
+*.bin
+*.map
+*.lst
+*.htm
+*.lnp
+*.dep
+*.iex
+
+# ===== CMake / Ninja 构建目录 =====
+build/
+build-*/
+CMakeFiles/
+CMakeCache.txt
+*.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# ===== 编辑器个人配置 =====
+.vscode/settings.json
+*.code-workspace
+
+# ===== 大体积素材 =====
+frames/
+*.mp4
+*.avi
+*.zip
+
+# ===== 系统 =====
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ===== 注意：以下必须提交 =====
+# *.ioc                  CubeMX 工程（引脚配置的唯一来源）
+# .mxproject             CubeMX 内部记录
+# CMakePresets.json      构建预设
+# CMakeLists.txt         根构建脚本
+# cmake/                 工具链、链接脚本、user_sources.cmake、startup
+# STM32H743xx_FLASH.ld   链接脚本
+# fix_after_generate.py  CubeMX 重新生成后的自动修复脚本
